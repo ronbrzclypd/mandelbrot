@@ -1,10 +1,12 @@
 package main
 
 import (
-	//	"bytes"
+	"bytes"
+	"encoding/base64"
+	"fmt"
+	"html/template"
 	"image"
 	"image/color"
-	//	"image/draw"
 	"image/jpeg"
 	"math/cmplx"
 	"net/http"
@@ -12,17 +14,12 @@ import (
 	"strconv"
 )
 
-// Page1 ...
-type Page1 struct {
-	Title string
-	Body  []byte
-}
-
 // View is what you are looking at, the rectangle
 // within these two complex numbers in the plane
 type Range struct {
-	max complex128
-	min complex128
+	max  complex128
+	min  complex128
+	iter int
 }
 
 // width and height of picture
@@ -42,7 +39,7 @@ func numIterate(n complex128, maxIteration int) (numIter int, bailp bool) {
 		i++
 	}
 	if i == maxIteration {
-		return -1, true
+		return 0, true
 	}
 	return i, false
 
@@ -68,49 +65,61 @@ func pixelToCmplx(r Range, f Frame, x, y int) complex128 {
 // Creates a JPEG mandelbrot image
 func mandelImage(r Range, f Frame) image.Image {
 	m := image.NewRGBA(image.Rect(0, 0, f.width, f.height))
-	maxIteration := 100
+	ch := make(chan struct{}, 4)
 	for x := 0; x < f.width; x++ {
-		for y := 0; y < f.height; y++ {
-			num := pixelToCmplx(r, f, x, y)
-			_, bailp := numIterate(num, maxIteration)
-			if bailp {
-				m.Set(x, y, color.Black)
-			} else {
-				m.Set(x, y, color.White)
-			}
-		}
+		go setMandelImageCol(x, m, ch, r, f)
+	}
+	for count := 0; count < f.width; count++ {
+		<-ch
 	}
 	return m
 }
 
-// url parameters will be of the form "/?centerX=...&centerY=...&sizeY=...&sizeX=...&height=...&width=..."
+// helper function to mandelImage function. Sets all coordinates in
+// given image in column x
+func setMandelImageCol(x int, m *image.RGBA, ch chan struct{}, r Range, f Frame) {
+	maxIteration := r.iter
+	for y := 0; y < f.height; y++ {
+		num := pixelToCmplx(r, f, x, y)
+		i, inSet := numIterate(num, maxIteration)
+		if inSet {
+			m.Set(x, y, color.Black)
+		} else {
+			bComp := i % 255
+			rComp := 255 - bComp
+			colr := color.RGBA{R: uint8(rComp), G: 0, B: uint8(bComp), A: 0}
+			m.Set(x, y, colr)
+		}
+	}
+	ch <- struct{}{}
+
+}
+
+// url parameters will be of the form
+// "/?centerX=...&centerY=...&sizeY=...&sizeX=...&height=...&width=..."
 func getURLparams(u *url.URL) (r Range, f Frame) {
 	m := u.Query()
 	var maxX, maxY, minX, minY float64
 	var width, height int
 	var max, min complex128
 
-	allhere := true
-	for _, v := range m {
-		allhere &= v != nil
-	}
-
+	allhere := len(m) > 5
 	if !allhere {
 		max = complex(1, 1)
 		min = complex(-2, -1)
 		width = 600
 		height = 400
-	} else {
-		mFloat := make(map[string]float64)
-		mInt := make(map[string]int)
+	} else { // Is there a better way to do this?
+		mFloat := map[string]float64{}
+		mInt := map[string]int{}
+		fmt.Println(m)
+		mFloat["centerX"], _ = strconv.ParseFloat(m["centerX"][0], 64)
+		mFloat["centerY"], _ = strconv.ParseFloat(m["centerY"][0], 64)
+		mFloat["sizeX"], _ = strconv.ParseFloat(m["sizeX"][0], 64)
+		mFloat["sizeY"], _ = strconv.ParseFloat(m["sizeY"][0], 64)
 
-		mFloat["centerX"], _ = strconv.ParseFloat(m["centerX"], 64)
-		mFloat["centerY"], _ = strconv.ParseFloat(m["centerY"], 64)
-		mFloat["sizeX"], _ = strconv.ParseFloat(m["sizeX"], 64)
-		mFloat["sizeY"], _ = strconv.ParseFloat(m["sizeY"], 64)
-
-		gg, _ := strconv.ParseInt(m["width"], 0, 0)
-		gg2, _ := strconv.ParseInt(m["height"], 10, 0)
+		gg, _ := strconv.ParseInt(m["width"][0], 0, 0)
+		gg2, _ := strconv.ParseInt(m["height"][0], 10, 0)
 		mInt["width"] = int(gg)
 		mInt["height"] = int(gg2)
 
@@ -127,18 +136,30 @@ func getURLparams(u *url.URL) (r Range, f Frame) {
 		height = mInt["height"]
 	}
 
-	r = Range{max: max, min: min}
+	r = Range{max: max, min: min, iter: 1000}
 	f = Frame{width: width, height: height}
 
 	return r, f
 
 }
-func handler(w http.ResponseWriter, r *http.Request) {
 
+// Writes image to template, then writes that to the responseWriter
+func writeImageWithTemplate(w http.ResponseWriter, img *image.Image) (err error) {
+	buffer := new(bytes.Buffer)
+	jpeg.Encode(buffer, *img, nil)
+	str := base64.StdEncoding.EncodeToString(buffer.Bytes())
+	t, _ := template.ParseFiles("static/page.html")
+	data := map[string]interface{}{"Image": str}
+	err = t.Execute(w, data)
+	return
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
 	u := r.URL
 	ran, f := getURLparams(u)
 	m := mandelImage(ran, f)
-	err := jpeg.Encode(w, m, &jpeg.Options{Quality: 100})
+
+	err := writeImageWithTemplate(w, &m)
 	if err != nil {
 		return
 	}
